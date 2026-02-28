@@ -6,6 +6,7 @@
 #include <iostream>
 #include <netinet/in.h>
 #include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -20,6 +21,41 @@ static void do_something(int connfd) {
   std::string wbuf = "world";
   // For now, we ignore the return value
   write(connfd, wbuf.data(), wbuf.size());
+}
+
+static int one_request(int connfd) {
+  std::array<char, sizeof(u32) + kMaxMsg> rbuf;
+  errno = 0;
+
+  auto err = read_full(connfd, rbuf.data(), sizeof(u32));
+  if (err) {
+    std::cerr << (errno == 0 ? "EOF" : std::strerror(errno)) << '\n';
+    return err;
+  }
+
+  u32 len = 0;
+  memcpy(&len, &rbuf[0], sizeof(u32));
+  if (len > kMaxMsg) {
+    std::cerr << "The message is too long: " << len << '\n';
+    return -1;
+  }
+
+  err = read_full(connfd, &rbuf[sizeof(u32)], len);
+  if (err) {
+    std::cerr << (errno == 0 ? "EOF" : std::strerror(errno)) << '\n';
+    return err;
+  }
+
+  std::cout << "client says: ";
+  std::cout.write(&rbuf[sizeof(u32)], len);
+  std::cout << '\n';
+
+  constexpr std::string_view reply = "world";
+  len = reply.size();
+  std::array<char, sizeof(u32) + reply.size()> wbuf;
+  std::memcpy(&wbuf[0], &len, sizeof(u32));
+  std::memcpy(&wbuf[sizeof(u32)], reply.data(), reply.size());
+  return write_all(connfd, wbuf.data(), wbuf.size());
 }
 
 int main() {
@@ -54,14 +90,17 @@ int main() {
   while (true) {
     sockaddr_in client_addr{};
     socklen_t addrlen = sizeof(client_addr);
-    int connfd =
+    const auto connfd =
         accept(listenfd, reinterpret_cast<sockaddr *>(&client_addr), &addrlen);
     if (connfd < 0) {
       std::cerr << std::string("accept: ") + std::strerror(errno) << std::endl;
       continue;
     }
 
-    do_something(connfd);
+    // do_something(connfd);
+
+    while (one_request(connfd) == 0)
+      ;
 
     close(connfd);
   }
