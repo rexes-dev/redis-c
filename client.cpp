@@ -8,14 +8,28 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static int send_req(int fd, const u8 *text, u32 len) {
+static int send_req(int fd, const std::vector<std::string> &cmd) {
+  u32 len = sizeof(u32);
+  for (const auto &s : cmd)
+    len += sizeof(u32) + s.size();
+
   if (len > kMaxMsg)
     return -1;
 
   std::vector<u8> wbuf(sizeof(u32) + len);
   std::memcpy(&wbuf[0], &len, sizeof(u32));
-  std::memcpy(&wbuf[sizeof(u32)], text, len);
-  return write_all(fd, wbuf.data(), sizeof(u32) + len);
+
+  const u32 ncmd = cmd.size();
+  std::memcpy(&wbuf[sizeof(u32)], &ncmd, sizeof(u32));
+
+  u32 offset = 2 * sizeof(u32);
+  for (const auto &s : cmd) {
+    const u32 slen = s.size();
+    std::memcpy(&wbuf[offset], &slen, sizeof(u32));
+    std::memcpy(&wbuf[offset + sizeof(u32)], s.data(), s.size());
+    offset += sizeof(u32) + slen;
+  }
+  return write_all(fd, wbuf.data(), wbuf.size());
 }
 
 static int read_res(int fd) {
@@ -33,6 +47,10 @@ static int read_res(int fd) {
     std::cerr << "The message is too long: " << len << '\n';
     return -1;
   }
+  if (len < 4) {
+    std::cerr << "Bad response" << '\n';
+    return -1;
+  }
 
   rbuf.resize(sizeof(u32) + len);
   err = read_full(fd, &rbuf[sizeof(u32)], len);
@@ -40,13 +58,17 @@ static int read_res(int fd) {
     std::cerr << (errno == 0 ? "EOF" : std::strerror(errno)) << '\n';
     return err;
   }
-  std::cout << "len:" << len << " data:";
-  std::cout.write(reinterpret_cast<const char *>(&rbuf[sizeof(u32)]), len);
+  u32 rescode = 0;
+  std::memcpy(&rescode, &rbuf[sizeof(u32)], sizeof(u32));
+
+  std::cout << "server says: [" << rescode << "] ";
+  std::cout.write(reinterpret_cast<const char *>(&rbuf[2 * sizeof(u32)]),
+                  len - 4);
   std::cout << '\n';
   return 0;
 }
 
-int main() {
+int main(int argc, char **argv) {
   const auto fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0)
     unix_error("socket");
@@ -59,26 +81,17 @@ int main() {
   if (connect(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0)
     unix_error("connect");
 
-  const std::vector<std::string> query_list = {
-      "hello1",
-      "hello2",
-      "hello3",
-      // a large message requires multiple event loop iterations
-      std::string(kMaxMsg, 'z'),
-      "hello5",
-  };
-  for (const auto &s : query_list) {
-    const auto err =
-        send_req(fd, reinterpret_cast<const u8 *>(s.data()), s.size());
-    if (err)
-      goto L_DONE;
-  }
+  std::vector<std::string> cmd;
+  for (int i = 1; i < argc; ++i)
+    cmd.push_back(argv[i]);
 
-  for (const auto &_ : query_list) {
-    const auto err = read_res(fd);
-    if (err)
-      goto L_DONE;
-  }
+  auto err = send_req(fd, cmd);
+  if (err)
+    goto L_DONE;
+
+  err = read_res(fd);
+  if (err)
+    goto L_DONE;
 
 L_DONE:
   close(fd);

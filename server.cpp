@@ -11,9 +11,12 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <string>
 #include <string_view>
 #include <vector>
+
+static std::map<std::string, std::string> g_data;
 
 static Conn *handle_accept(int listenfd) {
   // accept
@@ -37,6 +40,66 @@ static Conn *handle_accept(int listenfd) {
   return conn;
 }
 
+static int parse_req(const u8 *data, size_t size,
+                     std::vector<std::string> &out) {
+  u32 nstr = 0;
+  if (size < sizeof(u32))
+    return -1;
+
+  std::memcpy(&nstr, data, sizeof(u32));
+  size -= sizeof(u32);
+  data += sizeof(u32);
+
+  for (u32 i = 0; i < nstr; ++i) {
+    u32 len = 0;
+    if (size < sizeof(u32))
+      return -1;
+
+    std::memcpy(&len, data, sizeof(u32));
+    size -= sizeof(u32);
+    data += sizeof(u32);
+    out.push_back("");
+
+    if (size < len)
+      return -1;
+    out.back().assign(data, data + len);
+    size -= len;
+    data += len;
+  }
+
+  if (size > 0)
+    return -1;
+
+  return 0;
+}
+
+static void do_request(std::vector<std::string> &cmd, Response &res) {
+  if (cmd.size() == 2 && cmd[0] == "get") {
+    auto it = g_data.find(cmd[1]);
+    if (it == g_data.end()) {
+      res.status = RES_NX; // not found
+      return;
+    }
+    const auto &val = it->second;
+    res.data.assign(val.begin(), val.end());
+  } else if (cmd.size() == 3 && cmd[0] == "set") {
+    g_data[cmd[1]].swap(cmd[2]);
+  } else if (cmd.size() == 2 && cmd[0] == "del") {
+    g_data.erase(cmd[1]);
+  } else {
+    res.status = RES_ERR; // unrecognized command
+  }
+}
+
+static void make_response(const Response &res, std::vector<u8> &out) {
+  const u32 res_len = sizeof(u32) + res.data.size();
+  const u32 out_len = sizeof(u32) + res_len;
+  out.resize(out_len);
+  std::memcpy(&out[0], &res_len, sizeof(u32));
+  std::memcpy(&out[sizeof(u32)], &res.status, sizeof(u32));
+  std::memcpy(&out[2 * sizeof(u32)], &res.data[0], res.data.size());
+}
+
 static bool try_one_request(Conn *conn) {
   // 3. Try to parse the accumulated buf
   if (conn->incoming.size() < sizeof(u32))
@@ -45,25 +108,26 @@ static bool try_one_request(Conn *conn) {
   u32 len = 0;
   memcpy(&len, conn->incoming.data(), sizeof(u32));
   if (len > kMaxMsg) {
+    std::cerr << "The message is too long: " << len << '\n';
     conn->want_close = true;
     return false;
   }
 
-  // Protocol: msg body
-  if (4 + len > conn->incoming.size())
+  // message body
+  if (sizeof(u32) + len > conn->incoming.size())
     return false;
 
-  // 4. Process the parsed message
-  // ...
+  const auto *req = &conn->incoming[sizeof(u32)];
 
-  // generate the response (echo)
-  const auto old_size = conn->outgoing.size();
-  conn->outgoing.resize(old_size + sizeof(u32) + len);
-  std::memcpy(&conn->outgoing[old_size], &len, sizeof(u32));
-  std::memcpy(&conn->outgoing[old_size + sizeof(u32)],
-              &conn->incoming[sizeof(u32)], len);
+  std::vector<std::string> cmd;
+  if (parse_req(req, len, cmd) < 0) {
+    conn->want_close = true;
+    return false;
+  }
+  Response res;
+  do_request(cmd, res);
+  make_response(res, conn->outgoing);
 
-  // 5. Remove the message from `Conn::incoming`
   conn->incoming.erase(conn->incoming.begin(),
                        conn->incoming.begin() + sizeof(u32) + len);
   return true;
