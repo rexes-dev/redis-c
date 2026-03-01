@@ -1,61 +1,107 @@
 #include "utils.h"
 
-#include <array>
-#include <cerrno>
-#include <cstring>
-#include <iostream>
+#include <fcntl.h>
 #include <netinet/in.h>
-#include <string>
-#include <string_view>
+#include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-static void do_something(int connfd) {
-  std::array<char, 64> rbuf{};
-  const auto n = read(connfd, rbuf.data(), rbuf.size() - 1);
-  if (n < 0)
-    unix_error("read");
-  std::cout << "client says: " << rbuf.data() << '\n';
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <vector>
 
-  std::string wbuf = "world";
-  // For now, we ignore the return value
-  write(connfd, wbuf.data(), wbuf.size());
+static Conn *handle_accept(int listenfd) {
+  // accept
+  sockaddr_in client_addr{};
+  socklen_t addrlen = sizeof(client_addr);
+
+  const auto connfd =
+      accept(listenfd, reinterpret_cast<sockaddr *>(&client_addr), &addrlen);
+  if (connfd < 0) {
+    std::cerr << std::string("accept: ") + std::strerror(errno) << '\n';
+    return nullptr;
+  }
+
+  // set the new connfd to non-blocking mode
+  fcntl(connfd, F_SETFL, fcntl(connfd, F_GETFL, 0) | O_NONBLOCK);
+
+  // create struct Conn
+  Conn *conn = new Conn();
+  conn->fd = connfd;
+  conn->want_read = true; // read the 1st req
+  return conn;
 }
 
-static int one_request(int connfd) {
-  std::array<char, sizeof(u32) + kMaxMsg> rbuf;
-  errno = 0;
-
-  auto err = read_full(connfd, rbuf.data(), sizeof(u32));
-  if (err) {
-    std::cerr << (errno == 0 ? "EOF" : std::strerror(errno)) << '\n';
-    return err;
-  }
+static bool try_one_request(Conn *conn) {
+  // 3. Try to parse the accumulated buf
+  if (conn->incoming.size() < sizeof(u32))
+    return false;
 
   u32 len = 0;
-  memcpy(&len, &rbuf[0], sizeof(u32));
+  memcpy(&len, conn->incoming.data(), sizeof(u32));
   if (len > kMaxMsg) {
-    std::cerr << "The message is too long: " << len << '\n';
-    return -1;
+    conn->want_close = true;
+    return false;
   }
 
-  err = read_full(connfd, &rbuf[sizeof(u32)], len);
-  if (err) {
-    std::cerr << (errno == 0 ? "EOF" : std::strerror(errno)) << '\n';
-    return err;
+  // Protocol: msg body
+  if (4 + len > conn->incoming.size())
+    return false;
+
+  // 4. Process the parsed message
+  // ...
+
+  // generate the response (echo)
+  const auto old_size = conn->outgoing.size();
+  conn->outgoing.resize(old_size + sizeof(u32) + len);
+  std::memcpy(&conn->outgoing[old_size], &len, sizeof(u32));
+  std::memcpy(&conn->outgoing[old_size + sizeof(u32)],
+              &conn->incoming[sizeof(u32)], len);
+
+  // 5. Remove the message from `Conn::incoming`
+  conn->incoming.erase(conn->incoming.begin(),
+                       conn->incoming.begin() + sizeof(u32) + len);
+  return true;
+}
+
+static void handle_read(Conn *conn) {
+  // 1. Do a non-blocking read
+  std::array<u8, 64 * 1024> buf;
+  const auto rv = read(conn->fd, buf.data(), buf.size());
+  if (rv <= 0) { // handle IO error (rv < 0) or EOF (rv == 0)
+    conn->want_close = true;
+    return;
   }
 
-  std::cout << "client says: ";
-  std::cout.write(&rbuf[sizeof(u32)], len);
-  std::cout << '\n';
+  // 2. Add new data to the `Conn::incoming` buffer
+  conn->incoming.insert(conn->incoming.end(), buf.data(), buf.data() + rv);
 
-  constexpr std::string_view reply = "world";
-  len = reply.size();
-  std::array<char, sizeof(u32) + reply.size()> wbuf;
-  std::memcpy(&wbuf[0], &len, sizeof(u32));
-  std::memcpy(&wbuf[sizeof(u32)], reply.data(), reply.size());
-  return write_all(connfd, wbuf.data(), wbuf.size());
+  try_one_request(conn);
+
+  if (conn->outgoing.size() > 0) {
+    conn->want_read = false;
+    conn->want_write = true;
+  }
+}
+
+static void handle_write(Conn *conn) {
+  const auto rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+  if (rv < 0) {
+    conn->want_close = true;
+    return;
+  }
+
+  if (conn->outgoing.size() == 0) {
+    conn->want_read = true;
+    conn->want_write = false;
+  }
+
+  conn->outgoing.erase(conn->outgoing.begin(), conn->outgoing.begin() + rv);
 }
 
 int main() {
@@ -87,22 +133,73 @@ int main() {
   if (listen(listenfd, SOMAXCONN) != 0)
     unix_error("listen");
 
+  // a map of all client connections, keyed by fd;
+  std::vector<Conn *> fd2conn;
+
+  // the event loop
+  std::vector<pollfd> poll_args;
   while (true) {
-    sockaddr_in client_addr{};
-    socklen_t addrlen = sizeof(client_addr);
-    const auto connfd =
-        accept(listenfd, reinterpret_cast<sockaddr *>(&client_addr), &addrlen);
-    if (connfd < 0) {
-      std::cerr << std::string("accept: ") + std::strerror(errno) << std::endl;
-      continue;
+    // prepare the arguments of the poll()
+    poll_args.clear();
+
+    // put the listening sockets in the first position
+    // accept() is treated as read()
+    pollfd pfd{listenfd, POLLIN, 0};
+    poll_args.push_back(pfd);
+
+    // the rest are connection sockets
+    for (auto *conn : fd2conn) {
+      if (!conn)
+        continue;
+
+      // POLLERR indicates a socket error that
+      // we always want to be notified about
+      pollfd pfd{conn->fd, POLLERR, 0};
+
+      // poll() flags from the app's intent
+      if (conn->want_read)
+        pfd.events |= POLLIN;
+      if (conn->want_write)
+        pfd.events |= POLLOUT;
+      poll_args.push_back(pfd);
     }
 
-    // do_something(connfd);
+    // wait for readiness
+    const auto err = poll(poll_args.data(), poll_args.size(), -1);
+    if (err < 0) {
+      if (errno == EINTR)
+        continue; // not an error
 
-    while (one_request(connfd) == 0)
-      ;
+      unix_error("poll");
+    }
 
-    close(connfd);
+    // handle the listening socket
+    if (poll_args[0].revents) {
+      if (Conn *conn = handle_accept(listenfd)) {
+        // put into the map
+        if (fd2conn.size() <= static_cast<size_t>(conn->fd))
+          fd2conn.resize(conn->fd + 1);
+        fd2conn[conn->fd] = conn;
+      }
+    }
+
+    // handle connection sockets
+    for (size_t i = 1; i < poll_args.size(); ++i) {
+      const auto poll_arg = poll_args[i];
+      const auto ready = poll_arg.revents;
+      auto *conn = fd2conn[poll_arg.fd];
+      if (ready & POLLIN)
+        handle_read(conn);
+      if (ready & POLLOUT)
+        handle_write(conn);
+
+      // close the socket from socket error or app logic
+      if ((ready & POLLERR) || conn->want_close) {
+        close(conn->fd);
+        fd2conn[conn->fd] = nullptr;
+        delete conn;
+      }
+    }
   }
 
   return 0;
