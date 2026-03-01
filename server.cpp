@@ -69,6 +69,26 @@ static bool try_one_request(Conn *conn) {
   return true;
 }
 
+static void handle_write(Conn *conn) {
+  const auto rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+
+  // probably kernel buf is full
+  if (rv < 0 && errno == EAGAIN)
+    return;
+
+  if (rv < 0) {
+    conn->want_close = true;
+    return;
+  }
+
+  if (conn->outgoing.size() == 0) {
+    conn->want_read = true;
+    conn->want_write = false;
+  }
+
+  conn->outgoing.erase(conn->outgoing.begin(), conn->outgoing.begin() + rv);
+}
+
 static void handle_read(Conn *conn) {
   // 1. Do a non-blocking read
   std::array<u8, 64 * 1024> buf;
@@ -81,27 +101,16 @@ static void handle_read(Conn *conn) {
   // 2. Add new data to the `Conn::incoming` buffer
   conn->incoming.insert(conn->incoming.end(), buf.data(), buf.data() + rv);
 
-  try_one_request(conn);
+  while (try_one_request(conn))
+    ;
 
   if (conn->outgoing.size() > 0) {
     conn->want_read = false;
     conn->want_write = true;
-  }
-}
 
-static void handle_write(Conn *conn) {
-  const auto rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
-  if (rv < 0) {
-    conn->want_close = true;
-    return;
+    // No need to wait until next event loop
+    return handle_write(conn);
   }
-
-  if (conn->outgoing.size() == 0) {
-    conn->want_read = true;
-    conn->want_write = false;
-  }
-
-  conn->outgoing.erase(conn->outgoing.begin(), conn->outgoing.begin() + rv);
 }
 
 int main() {

@@ -8,43 +8,41 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-static int query(int fd, const char *text) {
-  auto len = static_cast<u32>(strlen(text));
+static int send_req(int fd, const u8 *text, u32 len) {
   if (len > kMaxMsg)
     return -1;
 
-  std::array<char, sizeof(u32) + kMaxMsg> wbuf;
+  std::vector<u8> wbuf(sizeof(u32) + len);
   std::memcpy(&wbuf[0], &len, sizeof(u32));
   std::memcpy(&wbuf[sizeof(u32)], text, len);
+  return write_all(fd, wbuf.data(), sizeof(u32) + len);
+}
 
-  auto err = write_all(fd, wbuf.data(), sizeof(u32) + len);
-  if (err)
-    return err;
-
-  std::array<char, sizeof(u32) + kMaxMsg> rbuf;
+static int read_res(int fd) {
+  std::vector<u8> rbuf(sizeof(u32));
   errno = 0;
-
-  err = read_full(fd, &rbuf[0], sizeof(u32));
+  auto err = read_full(fd, &rbuf[0], sizeof(u32));
   if (err) {
     std::cerr << (errno == 0 ? "EOF" : std::strerror(errno)) << '\n';
     return err;
   }
 
+  u32 len = 0;
   std::memcpy(&len, &rbuf[0], sizeof(u32));
   if (len > kMaxMsg) {
     std::cerr << "The message is too long: " << len << '\n';
     return -1;
   }
+
+  rbuf.resize(sizeof(u32) + len);
   err = read_full(fd, &rbuf[sizeof(u32)], len);
   if (err) {
     std::cerr << (errno == 0 ? "EOF" : std::strerror(errno)) << '\n';
     return err;
   }
-
-  std::cout << "server says: ";
-  std::cout.write(&rbuf[sizeof(u32)], len);
+  std::cout << "len:" << len << " data:";
+  std::cout.write(reinterpret_cast<const char *>(&rbuf[sizeof(u32)]), len);
   std::cout << '\n';
-
   return 0;
 }
 
@@ -61,23 +59,26 @@ int main() {
   if (connect(fd, reinterpret_cast<const sockaddr *>(&addr), sizeof(addr)) != 0)
     unix_error("connect");
 
-  // std::string msg = "hello";
-  // write(fd, msg.data(), msg.size());
+  const std::vector<std::string> query_list = {
+      "hello1",
+      "hello2",
+      "hello3",
+      // a large message requires multiple event loop iterations
+      std::string(kMaxMsg, 'z'),
+      "hello5",
+  };
+  for (const auto &s : query_list) {
+    const auto err =
+        send_req(fd, reinterpret_cast<const u8 *>(s.data()), s.size());
+    if (err)
+      goto L_DONE;
+  }
 
-  // std::array<char, 64> rbuf{};
-  // const auto n = read(fd, rbuf.data(), rbuf.size() - 1);
-  // if (n < 0)
-  //   unix_error("read");
-
-  // std::cout << "server says: " << rbuf.data() << '\n';
-
-  auto err = query(fd, "hello1");
-  if (err)
-    goto L_DONE;
-
-  err = query(fd, "hello2");
-  if (err)
-    goto L_DONE;
+  for (const auto &_ : query_list) {
+    const auto err = read_res(fd);
+    if (err)
+      goto L_DONE;
+  }
 
 L_DONE:
   close(fd);

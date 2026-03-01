@@ -12,13 +12,14 @@
 using u32 = uint32_t;
 using u8 = uint8_t;
 
-constexpr auto kMaxMsg = 4096;
+// constexpr auto kMaxMsg = 4096;
+constexpr auto kMaxMsg = 32 << 20; // likely larger than kernel buf
 
 static void unix_error(const char *msg) {
   throw std::runtime_error(std::string(msg) + ": " + std::strerror(errno));
 }
 
-static int read_full(int fd, char *buf, size_t n) {
+static int read_full(int fd, u8 *buf, size_t n) {
   while (n > 0) {
     const auto rv = read(fd, buf, n);
     if (rv == -1 && errno == EINTR)
@@ -31,7 +32,7 @@ static int read_full(int fd, char *buf, size_t n) {
   return 0;
 }
 
-static int write_all(int fd, const char *buf, size_t n) {
+static int write_all(int fd, const u8 *buf, size_t n) {
   while (n > 0) {
     const auto rv = write(fd, buf, n);
     if (rv <= 0)
