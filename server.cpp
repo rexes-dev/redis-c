@@ -40,22 +40,61 @@ static u64 std_hash(const u8 *data, size_t len) {
   return h;
 }
 
-static void do_get(std::vector<std::string> &cmd, Response &res) {
+static void out_nil(Buffer &out) { out.push_back(TAG_NIL); }
+
+static void out_str(Buffer &out, const char *s, size_t size) {
+  out.push_back(TAG_STR);
+  const auto out_size = out.size();
+  out.resize(out_size + sizeof(u32) + size);
+  std::memcpy(&out[out_size], &size, sizeof(u32));
+  std::memcpy(&out[out_size + sizeof(u32)], s, size);
+}
+
+static void out_int(Buffer &out, i64 val) {
+  out.push_back(TAG_INT);
+  const auto out_size = out.size();
+  out.resize(out_size + sizeof(i64));
+  std::memcpy(&out[out_size], &val, sizeof(i64));
+}
+
+static void out_dbl(Buffer &out, double val) {
+  out.push_back(TAG_DBL);
+  const auto out_size = out.size();
+  out.resize(out_size + sizeof(double));
+  std::memcpy(&out[out_size], &val, sizeof(double));
+}
+
+static void out_err(Buffer &out, u32 code, const std::string &msg) {
+  out.push_back(TAG_ERR);
+  const auto out_size = out.size();
+  out.resize(out_size + 2 * sizeof(u32) + msg.size());
+  std::memcpy(&out[out_size], &code, sizeof(u32));
+  const u32 msg_size = msg.size();
+  std::memcpy(&out[out_size + sizeof(u32)], &msg_size, sizeof(u32));
+  std::memcpy(&out[out_size + 2 * sizeof(u32)], msg.data(), sizeof(u32));
+}
+
+static void out_arr(Buffer &out, u32 n) {
+  out.push_back(TAG_ARR);
+  const auto out_size = out.size();
+  out.resize(out_size + sizeof(u32));
+  std::memcpy(&out[out_size], &n, sizeof(u32));
+}
+static void do_get(std::vector<std::string> &cmd, Buffer &res) {
   Entry key;
   key.key.swap(cmd[1]);
   key.node.hcode =
       std_hash(reinterpret_cast<const u8 *>(key.key.data()), key.key.size());
 
   const auto *node = hm_lookup(&g_data.db, &key.node, entry_eq);
-  if (!node) {
-    res.status = RES_NX;
-    return;
-  }
+  if (!node)
+    return out_nil(res);
+
   const auto &val = container_of(node, Entry, node)->val;
-  res.data.assign(val.begin(), val.end());
+  return out_str(res, val.data(), val.size());
 }
 
-static void do_set(std::vector<std::string> &cmd, Response &res) {
+static void do_set(std::vector<std::string> &cmd, Buffer &res) {
   Entry key;
   key.key.swap(cmd[1]);
   key.node.hcode =
@@ -71,9 +110,10 @@ static void do_set(std::vector<std::string> &cmd, Response &res) {
     ent->val.swap(cmd[2]);
     hm_insert(&g_data.db, &ent->node);
   }
+  return out_nil(res);
 }
 
-static void do_del(std::vector<std::string> &cmd, Response &res) {
+static void do_del(std::vector<std::string> &cmd, Buffer &res) {
   Entry key;
   key.key.swap(cmd[1]);
   key.node.hcode =
@@ -82,6 +122,19 @@ static void do_del(std::vector<std::string> &cmd, Response &res) {
   const auto *node = hm_delete(&g_data.db, &key.node, entry_eq);
   if (node)
     delete container_of(node, Entry, node);
+  return out_int(res, node ? 1 : 0);
+}
+
+static bool cb_keys(HNode *node, void *arg) {
+  Buffer &out = *static_cast<Buffer *>(arg);
+  const auto &key = container_of(node, Entry, node)->key;
+  out_str(out, key.data(), key.size());
+  return true;
+}
+
+static void do_keys(std::vector<std::string> &cmd, Buffer &res) {
+  out_arr(res, hm_size(&g_data.db));
+  hm_foreach(&g_data.db, cb_keys, (void *)&res);
 }
 
 static Conn *handle_accept(int listenfd) {
@@ -139,24 +192,39 @@ static int parse_req(const u8 *data, size_t size,
   return 0;
 }
 
-static void do_request(std::vector<std::string> &cmd, Response &res) {
+static void do_request(std::vector<std::string> &cmd, Buffer &res) {
   if (cmd.size() == 2 && cmd[0] == "get")
     do_get(cmd, res);
   else if (cmd.size() == 3 && cmd[0] == "set")
     do_set(cmd, res);
   else if (cmd.size() == 2 && cmd[0] == "del")
     do_del(cmd, res);
+  else if (cmd.size() == 1 && cmd[0] == "keys")
+    do_keys(cmd, res);
   else
-    res.status = RES_ERR; // unrecognized command
+    out_err(res, ERR_UNKNOWN, "Unknown command.");
 }
 
-static void make_response(const Response &res, std::vector<u8> &out) {
-  const u32 res_len = sizeof(u32) + res.data.size();
-  const u32 out_len = sizeof(u32) + res_len;
-  out.resize(out_len);
-  std::memcpy(&out[0], &res_len, sizeof(u32));
-  std::memcpy(&out[sizeof(u32)], &res.status, sizeof(u32));
-  std::memcpy(&out[2 * sizeof(u32)], &res.data[0], res.data.size());
+static void response_begin(Buffer &out, size_t *header) {
+  const auto out_size = out.size();
+  *header = out_size;
+  out.resize(out_size + sizeof(u32));
+  u32 zero = 0;
+  std::memcpy(&out[out_size], &zero, sizeof(u32));
+}
+
+static size_t response_size(Buffer &out, size_t header) {
+  return out.size() - header - sizeof(u32);
+}
+
+static void response_end(Buffer &out, size_t header) {
+  u32 msg_size = response_size(out, header);
+  if (msg_size > kMaxMsg) {
+    out.resize(header + sizeof(u32));
+    out_err(out, ERR_TOO_BIG, "Response is too big.");
+    msg_size = response_size(out, header);
+  }
+  std::memcpy(&out[header], &msg_size, sizeof(u32));
 }
 
 static bool try_one_request(Conn *conn) {
@@ -183,9 +251,11 @@ static bool try_one_request(Conn *conn) {
     conn->want_close = true;
     return false;
   }
-  Response res;
-  do_request(cmd, res);
-  make_response(res, conn->outgoing);
+
+  size_t header_pos = 0;
+  response_begin(conn->outgoing, &header_pos);
+  do_request(cmd, conn->outgoing);
+  response_end(conn->outgoing, header_pos);
 
   conn->incoming.erase(conn->incoming.begin(),
                        conn->incoming.begin() + sizeof(u32) + len);
