@@ -1,3 +1,4 @@
+#include "htab.h"
 #include "utils.h"
 
 #include <fcntl.h>
@@ -16,7 +17,72 @@
 #include <string_view>
 #include <vector>
 
-static std::map<std::string, std::string> g_data;
+#define container_of(ptr, T, member) ((T *)((char *)ptr - offsetof(T, member)))
+
+static struct { HMap db; } g_data;
+
+struct Entry {
+  struct HNode node;
+  std::string key;
+  std::string val;
+};
+
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+  const auto *le = container_of(lhs, Entry, node);
+  const auto *re = container_of(rhs, Entry, node);
+  return le->key == re->key;
+}
+
+static u64 std_hash(const u8 *data, size_t len) {
+  u64 h = 0x811C9DC5;
+  for (size_t i = 0; i < len; i++)
+    h = (h + data[i]) * 0x01000193;
+  return h;
+}
+
+static void do_get(std::vector<std::string> &cmd, Response &res) {
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode =
+      std_hash(reinterpret_cast<const u8 *>(key.key.data()), key.key.size());
+
+  const auto *node = hm_lookup(&g_data.db, &key.node, entry_eq);
+  if (!node) {
+    res.status = RES_NX;
+    return;
+  }
+  const auto &val = container_of(node, Entry, node)->val;
+  res.data.assign(val.begin(), val.end());
+}
+
+static void do_set(std::vector<std::string> &cmd, Response &res) {
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode =
+      std_hash(reinterpret_cast<const u8 *>(key.key.data()), key.key.size());
+
+  const auto &node = hm_lookup(&g_data.db, &key.node, entry_eq);
+  if (node)
+    container_of(node, Entry, node)->val.swap(cmd[2]);
+  else {
+    auto *ent = new Entry();
+    ent->node.hcode = key.node.hcode;
+    ent->key.swap(key.key);
+    ent->val.swap(cmd[2]);
+    hm_insert(&g_data.db, &ent->node);
+  }
+}
+
+static void do_del(std::vector<std::string> &cmd, Response &res) {
+  Entry key;
+  key.key.swap(cmd[1]);
+  key.node.hcode =
+      std_hash(reinterpret_cast<const u8 *>(key.key.data()), key.key.size());
+
+  const auto *node = hm_delete(&g_data.db, &key.node, entry_eq);
+  if (node)
+    delete container_of(node, Entry, node);
+}
 
 static Conn *handle_accept(int listenfd) {
   // accept
@@ -74,21 +140,14 @@ static int parse_req(const u8 *data, size_t size,
 }
 
 static void do_request(std::vector<std::string> &cmd, Response &res) {
-  if (cmd.size() == 2 && cmd[0] == "get") {
-    auto it = g_data.find(cmd[1]);
-    if (it == g_data.end()) {
-      res.status = RES_NX; // not found
-      return;
-    }
-    const auto &val = it->second;
-    res.data.assign(val.begin(), val.end());
-  } else if (cmd.size() == 3 && cmd[0] == "set") {
-    g_data[cmd[1]].swap(cmd[2]);
-  } else if (cmd.size() == 2 && cmd[0] == "del") {
-    g_data.erase(cmd[1]);
-  } else {
+  if (cmd.size() == 2 && cmd[0] == "get")
+    do_get(cmd, res);
+  else if (cmd.size() == 3 && cmd[0] == "set")
+    do_set(cmd, res);
+  else if (cmd.size() == 2 && cmd[0] == "del")
+    do_del(cmd, res);
+  else
     res.status = RES_ERR; // unrecognized command
-  }
 }
 
 static void make_response(const Response &res, std::vector<u8> &out) {

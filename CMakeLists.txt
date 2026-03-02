@@ -14,8 +14,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(server server.cpp)
-add_executable(client client.cpp) 
+add_executable(server server.cpp htab.cpp)
+add_executable(client client.cpp htab.cpp) 
 
 foreach(target server client)
     target_compile_options(${target} PRIVATE -Wall -Wextra)
